@@ -354,6 +354,75 @@ func NewStorageAsk(ctx helpers.MetricsCtx, fapi lapi.FullNode, ds dtypes.Metadat
 	return storedAsk, nil
 }
 
+func BasicDealFilter(user dtypes.DealFilter) func(onlineOk dtypes.ConsiderOnlineStorageDealsConfigFunc,
+	offlineOk dtypes.ConsiderOfflineStorageDealsConfigFunc,
+	blocklistFunc dtypes.StorageDealPieceCidBlocklistConfigFunc,
+	expectedSealTimeFunc dtypes.GetExpectedSealDurationFunc,
+	spn storagemarket.StorageProviderNode) dtypes.DealFilter {
+	return func(onlineOk dtypes.ConsiderOnlineStorageDealsConfigFunc,
+		offlineOk dtypes.ConsiderOfflineStorageDealsConfigFunc,
+		blocklistFunc dtypes.StorageDealPieceCidBlocklistConfigFunc,
+		expectedSealTimeFunc dtypes.GetExpectedSealDurationFunc,
+		spn storagemarket.StorageProviderNode) dtypes.DealFilter {
+
+		return func(ctx context.Context, deal storagemarket.MinerDeal) (bool, string, error) {
+			b, err := onlineOk()
+			if err != nil {
+				return false, "miner error", err
+			}
+
+			if deal.Ref != nil && deal.Ref.TransferType != storagemarket.TTManual && !b {
+				log.Warnf("online storage deal consideration disabled; rejecting storage deal proposal from client: %s", deal.Client.String())
+				return false, "miner is not considering online storage deals", nil
+			}
+
+			b, err = offlineOk()
+			if err != nil {
+				return false, "miner error", err
+			}
+
+			if deal.Ref != nil && deal.Ref.TransferType == storagemarket.TTManual && !b {
+				log.Warnf("offline storage deal consideration disabled; rejecting storage deal proposal from client: %s", deal.Client.String())
+				return false, "miner is not accepting offline storage deals", nil
+			}
+
+			blocklist, err := blocklistFunc()
+			if err != nil {
+				return false, "miner error", err
+			}
+
+			for idx := range blocklist {
+				if deal.Proposal.PieceCID.Equals(blocklist[idx]) {
+					log.Warnf("piece CID in proposal %s is blocklisted; rejecting storage deal proposal from client: %s", deal.Proposal.PieceCID, deal.Client.String())
+					return false, fmt.Sprintf("miner has blocklisted piece CID %s", deal.Proposal.PieceCID), nil
+				}
+			}
+
+			sealDuration, err := expectedSealTimeFunc()
+			if err != nil {
+				return false, "miner error", err
+			}
+
+			sealEpochs := sealDuration / (time.Duration(build.BlockDelaySecs) * time.Second)
+			_, ht, err := spn.GetChainHead(ctx)
+			if err != nil {
+				return false, "failed to get chain head", err
+			}
+			earliest := abi.ChainEpoch(sealEpochs) + ht
+			if deal.Proposal.StartEpoch < earliest {
+				log.Warnw("proposed deal would start before sealing can be completed; rejecting storage deal proposal from client", "piece_cid", deal.Proposal.PieceCID, "client", deal.Client.String(), "seal_duration", sealDuration, "earliest", earliest, "curepoch", ht)
+				return false, fmt.Sprintf("cannot seal a sector before %s", deal.Proposal.StartEpoch), nil
+			}
+
+			if user != nil {
+				return user(ctx, deal)
+			}
+
+			return true, "", nil
+		}
+	}
+}
+
 func StorageProvider(minerAddress dtypes.MinerAddress,
 	ffiConfig *ffiwrapper.Config,
 	storedAsk *storedask.StoredAsk,
@@ -363,67 +432,15 @@ func StorageProvider(minerAddress dtypes.MinerAddress,
 	pieceStore dtypes.ProviderPieceStore,
 	dataTransfer dtypes.ProviderDataTransfer,
 	spn storagemarket.StorageProviderNode,
-	onlineOk dtypes.ConsiderOnlineStorageDealsConfigFunc,
-	offlineOk dtypes.ConsiderOfflineStorageDealsConfigFunc,
-	blocklistFunc dtypes.StorageDealPieceCidBlocklistConfigFunc,
-	expectedSealTimeFunc dtypes.GetExpectedSealDurationFunc) (storagemarket.StorageProvider, error) {
+	df dtypes.DealFilter,
+) (storagemarket.StorageProvider, error) {
 	net := smnet.NewFromLibp2pHost(h)
 	store, err := piecefilestore.NewLocalFileStore(piecefilestore.OsPath(r.Path()))
 	if err != nil {
 		return nil, err
 	}
 
-	opt := storageimpl.CustomDealDecisionLogic(func(ctx context.Context, deal storagemarket.MinerDeal) (bool, string, error) {
-		b, err := onlineOk()
-		if err != nil {
-			return false, "miner error", err
-		}
-
-		if deal.Ref != nil && deal.Ref.TransferType != storagemarket.TTManual && !b {
-			log.Warnf("online storage deal consideration disabled; rejecting storage deal proposal from client: %s", deal.Client.String())
-			return false, "miner is not considering online storage deals", nil
-		}
-
-		b, err = offlineOk()
-		if err != nil {
-			return false, "miner error", err
-		}
-
-		if deal.Ref != nil && deal.Ref.TransferType == storagemarket.TTManual && !b {
-			log.Warnf("offline storage deal consideration disabled; rejecting storage deal proposal from client: %s", deal.Client.String())
-			return false, "miner is not accepting offline storage deals", nil
-		}
-
-		blocklist, err := blocklistFunc()
-		if err != nil {
-			return false, "miner error", err
-		}
-
-		for idx := range blocklist {
-			if deal.Proposal.PieceCID.Equals(blocklist[idx]) {
-				log.Warnf("piece CID in proposal %s is blocklisted; rejecting storage deal proposal from client: %s", deal.Proposal.PieceCID, deal.Client.String())
-				return false, fmt.Sprintf("miner has blocklisted piece CID %s", deal.Proposal.PieceCID), nil
-			}
-		}
-
-		sealDuration, err := expectedSealTimeFunc()
-		if err != nil {
-			return false, "miner error", err
-		}
-
-		sealEpochs := sealDuration / (time.Duration(build.BlockDelaySecs) * time.Second)
-		_, ht, err := spn.GetChainHead(ctx)
-		if err != nil {
-			return false, "failed to get chain head", err
-		}
-		earliest := abi.ChainEpoch(sealEpochs) + ht
-		if deal.Proposal.StartEpoch < earliest {
-			log.Warnw("proposed deal would start before sealing can be completed; rejecting storage deal proposal from client", "piece_cid", deal.Proposal.PieceCID, "client", deal.Client.String(), "seal_duration", sealDuration, "earliest", earliest, "curepoch", ht)
-			return false, fmt.Sprintf("cannot seal a sector before %s", deal.Proposal.StartEpoch), nil
-		}
-
-		return true, "", nil
-	})
+	opt := storageimpl.CustomDealDecisionLogic(storageimpl.DealDeciderFunc(df))
 
 	p, err := storageimpl.NewProvider(net, namespace.Wrap(ds, datastore.NewKey("/deals/provider")), store, mds, pieceStore, dataTransfer, spn, address.Address(minerAddress), ffiConfig.SealProofType, storedAsk, opt)
 	if err != nil {

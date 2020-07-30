@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"errors"
+	"github.com/filecoin-project/lotus/markets/dealfilter"
 	"time"
 
 	logging "github.com/ipfs/go-log"
@@ -308,6 +309,7 @@ func Online() Option {
 			Override(new(dtypes.ProviderRequestValidator), modules.NewProviderRequestValidator),
 			Override(new(dtypes.ProviderPieceStore), modules.NewProviderPieceStore),
 			Override(new(*storedask.StoredAsk), modules.NewStorageAsk),
+			Override(new(dtypes.DealFilter), modules.BasicDealFilter(nil)),
 			Override(new(storagemarket.StorageProvider), modules.StorageProvider),
 			Override(new(storagemarket.StorageProviderNode), storageadapter.NewProviderNodeAdapter),
 			Override(RegisterProviderValidatorKey, modules.RegisterProviderValidator),
@@ -422,6 +424,10 @@ func ConfigStorageMiner(c interface{}) Option {
 
 	return Options(
 		ConfigCommon(&cfg.Common),
+
+		If(cfg.Dealmaking.Filter != "",
+			Override(new(dtypes.DealFilter), modules.BasicDealFilter(dealfilter.CliDealFilter(cfg.Dealmaking.Filter))),
+		),
 
 		Override(new(sectorstorage.SealerConfig), cfg.Storage),
 	)
